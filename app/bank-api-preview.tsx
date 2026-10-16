@@ -92,7 +92,7 @@ type Area = { area: string; count: number };
 type Clock = { serverTime: string; realTime: string; mode: "live" | "running" | "frozen"; ordersAfterServerTime: number };
 
 const ranges: Range[] = ["1D", "1W", "1M", "3M", "1Y", "ALL"];
-const defaultUser = "mock-user-alex-morgan";
+const defaultUser = "";
 
 function money(value: number, currency: string) {
   return new Intl.NumberFormat("en-US", {
@@ -410,6 +410,14 @@ export default function BankApiPreview() {
   }, []);
 
   useEffect(() => {
+    if (!userId) {
+      setAccount(null);
+      setPortfolio(null);
+      setPortfolioHistory(null);
+      setOrders([]);
+      setIsLoading(false);
+      return;
+    }
     let active = true;
     const controller = new AbortController();
     setIsLoading(true);
@@ -612,8 +620,8 @@ export default function BankApiPreview() {
             setMessage("");
           } else setError("User ID must be between 1 and 120 characters.");
         }}>
-          <label htmlFor="bank-user-id">MOCK USER ID</label>
-          <div><input id="bank-user-id" value={userDraft} onChange={(event) => setUserDraft(event.target.value)} maxLength={120} /><button type="submit">Load</button></div>
+          <label htmlFor="bank-user-id">USER ID</label>
+          <div><input id="bank-user-id" placeholder="Enter a user ID" value={userDraft} onChange={(event) => setUserDraft(event.target.value)} maxLength={120} /><button type="submit">Load</button></div>
         </form>
       </div>
 

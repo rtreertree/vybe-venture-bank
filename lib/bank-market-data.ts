@@ -14,6 +14,7 @@ export function isChartRange(value: string): value is ChartRange {
 const DAY_MS = 24 * 60 * 60 * 1000;
 const SYNC_TTL_MS = 15 * 60 * 1000;
 const INTRADAY_INTERVAL = "15m";
+const INTRADAY_SNAPSHOT_DAYS = 59;
 // Days of daily history shown for each range; 1D and 1W read the intraday snapshot.
 const dailyWindowDays: Partial<Record<ChartRange, number>> = { "1M": 30, "3M": 90, "1Y": 365 };
 
@@ -36,7 +37,13 @@ type YahooSeries = { points: MarketPoint[]; currency?: string; name?: string };
 
 async function fetchYahooSeries(ticker: string, yahooRange: string, interval: string): Promise<YahooSeries> {
   const url = new URL(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}`);
-  url.searchParams.set("range", yahooRange);
+  if (yahooRange === "max") {
+    // range=max silently coarsens old history to monthly bars; an explicit period keeps the requested interval.
+    url.searchParams.set("period1", "0");
+    url.searchParams.set("period2", String(Math.floor(Date.now() / 1000)));
+  } else {
+    url.searchParams.set("range", yahooRange);
+  }
   url.searchParams.set("interval", interval);
 
   let response: Response;
@@ -206,7 +213,17 @@ export async function loadMarketSnapshot(product: Product, range: ChartRange, no
     }
   } else {
     const days = dailyWindowDays[range];
-    points = (await dailyBars(days ? new Date(now.getTime() - days * DAY_MS) : undefined)).map(toPoint);
+    const windowStart = days ? new Date(now.getTime() - days * DAY_MS) : undefined;
+    points = (await dailyBars(windowStart)).map(toPoint);
+    if (range === "1M" || range === "3M") {
+      // Daily closes alone are too sparse for 1M/3M, so the span covered by the intraday snapshot uses its denser bars.
+      const intradayFrom = new Date(Math.max(windowStart?.getTime() ?? 0, now.getTime() - INTRADAY_SNAPSHOT_DAYS * DAY_MS));
+      const intraday = (await intradayBars(intradayFrom)).map(toPoint);
+      if (intraday.length > 0) {
+        points = [...points.filter(({ t }) => t < intraday[0].t), ...intraday];
+        interval = INTRADAY_INTERVAL;
+      }
+    }
     if (points.length === 0 || points[points.length - 1].t < quote.asOf) points.push({ t: quote.asOf, v: quote.currentPrice });
   }
   if (points.length === 0) points = [{ t: quote.asOf, v: quote.currentPrice }];
@@ -232,7 +249,7 @@ export function summarizePoints(points: MarketPoint[]) {
   };
 }
 
-export function downsamplePoints(points: MarketPoint[], maximum = 250) {
+export function downsamplePoints(points: MarketPoint[], maximum = 400) {
   if (points.length <= maximum) return points;
   const bucketSize = Math.ceil(points.length / maximum);
   return points.filter((_, index) => index === points.length - 1 || index % bucketSize === bucketSize - 1);
