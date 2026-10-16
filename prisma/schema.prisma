@@ -1,0 +1,180 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+enum InvestmentAssetType {
+  STOCK
+  ETF
+  MUTUAL_FUND
+  BOND
+  CRYPTO
+  OTHER
+}
+
+enum InvestmentSide {
+  BUY
+  SELL
+}
+
+model InvestmentTrade {
+  id          String              @id @default(cuid())
+  userId      String              @db.VarChar(120)
+  symbol      String              @db.VarChar(12)
+  orderId     String?             @unique
+  assetType   InvestmentAssetType
+  side        InvestmentSide
+  quantity    Float
+  unitPrice   Decimal             @db.Decimal(20, 2)
+  totalAmount Decimal             @db.Decimal(20, 2)
+  tradedAt    DateTime            @default(now())
+  createdAt   DateTime            @default(now())
+
+  @@index([userId, tradedAt(sort: Desc)])
+}
+
+enum ProductType {
+  STOCK
+  FUND
+  BOND
+  CRYPTO
+  COMMODITY
+  REIT
+}
+
+enum ProductRisk {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum BankOrderSide {
+  BUY
+  SELL
+}
+
+enum BankOrderStatus {
+  PENDING
+  FILLED
+  REJECTED
+  CANCELLED
+}
+
+model BankAccount {
+  userId             String   @id @db.VarChar(120)
+  currency           String   @default("USD") @db.VarChar(3)
+  cashBalance        Decimal  @default(50000) @db.Decimal(20, 2)
+  openingCashBalance Decimal  @default(50000) @db.Decimal(20, 2)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  holdings Holding[]
+  orders   BankOrder[]
+}
+
+model Product {
+  symbol               String      @id @db.VarChar(12)
+  name                 String      @db.VarChar(160)
+  type                 ProductType
+  area                 String      @db.VarChar(120)
+  description          String      @db.Text
+  risk                 ProductRisk @default(MEDIUM)
+  riskNote             String      @db.Text
+  currency             String      @default("USD") @db.VarChar(3)
+  issuer               String      @db.VarChar(160)
+  region               String      @db.VarChar(80)
+  dividendYieldPercent Decimal     @default(0) @db.Decimal(10, 4)
+  size                 Decimal?    @db.Decimal(24, 2)
+  inceptionDate        DateTime?   @db.Date
+  topHoldings          Json?
+  dailySyncedAt        DateTime?
+  intradaySyncedAt     DateTime?
+  updatedAt            DateTime    @updatedAt
+
+  holdings     Holding[]
+  orders       BankOrder[]
+  priceBars    PriceBar[]
+
+  @@index([area])
+  @@index([type, risk])
+}
+
+enum PriceInterval {
+  DAILY
+  INTRADAY
+}
+
+// Market-data snapshot downloaded from Yahoo Finance. Every quote the bank serves is read from here as of the server time.
+model PriceBar {
+  symbol   String        @db.VarChar(12)
+  interval PriceInterval
+  t        DateTime
+  close    Decimal       @db.Decimal(20, 6)
+  product  Product       @relation(fields: [symbol], references: [symbol], onDelete: Cascade)
+
+  @@id([symbol, interval, t])
+}
+
+// Single-row table (id = 1). No row means the bank follows the real clock.
+// Server time = baseTime when frozen, otherwise baseTime + (real now - setAt).
+model ServerClock {
+  id        Int      @id @default(1)
+  baseTime  DateTime
+  setAt     DateTime @default(now())
+  frozen    Boolean  @default(false)
+  updatedAt DateTime @updatedAt
+}
+
+model Holding {
+  userId     String      @db.VarChar(120)
+  accountRef String      @default("") @db.VarChar(128)
+  symbol     String      @db.VarChar(12)
+  quantity Decimal     @default(0) @db.Decimal(24, 8)
+  avgCost  Decimal     @default(0) @db.Decimal(20, 6)
+  account  BankAccount @relation(fields: [userId], references: [userId], onDelete: Cascade)
+  product  Product     @relation(fields: [symbol], references: [symbol], onDelete: Restrict)
+
+  @@id([userId, accountRef, symbol])
+  @@index([symbol])
+}
+
+model BankOrder {
+  orderId        String          @id @default(cuid())
+  userId         String          @db.VarChar(120)
+  accountRef     String          @default("") @db.VarChar(128)
+  symbol         String          @db.VarChar(12)
+  side           BankOrderSide
+  status         BankOrderStatus @default(PENDING)
+  quantity       Decimal         @db.Decimal(24, 8)
+  filledPrice    Decimal?        @db.Decimal(20, 6)
+  priceAsOf      DateTime?
+  total          Decimal         @default(0) @db.Decimal(20, 2)
+  idempotencyKey String          @db.VarChar(120)
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  account        BankAccount     @relation(fields: [userId], references: [userId], onDelete: Cascade)
+  product        Product         @relation(fields: [symbol], references: [symbol], onDelete: Restrict)
+
+  @@unique([userId, idempotencyKey])
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([userId, status])
+  @@index([userId, accountRef, createdAt(sort: Desc)])
+}
+
+model playing_with_neon {
+  id    Int    @id @default(autoincrement())
+  name  String
+  value Float? @db.Real
+}
