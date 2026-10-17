@@ -49,13 +49,22 @@ export async function GET(request: Request) {
       },
     });
     const now = await getServerTime();
-    const market = await Promise.all(products.map(async (product) => ({
-      product,
-      prices: sort === "return1Y"
-        ? await loadMarketSnapshot(product, "1Y", now)
-        : { ...await loadMarketQuote(product, now), points: [] },
-    })));
-    const results = market.map(({ product, prices }) => {
+    const unavailableSymbols: string[] = [];
+    const market = await Promise.all(products.map(async (product) => {
+      try {
+        return {
+          product,
+          prices: sort === "return1Y"
+            ? await loadMarketSnapshot(product, "1Y", now)
+            : { ...await loadMarketQuote(product, now), points: [] },
+        };
+      } catch (error) {
+        if (!(error instanceof MarketDataError)) throw error;
+        unavailableSymbols.push(product.symbol);
+        return null;
+      }
+    }));
+    const results = market.filter((item) => item !== null).map(({ product, prices }) => {
       const currentPrice = prices.currentPrice;
       const previousClose = prices.previousClose ?? currentPrice;
       return {
@@ -94,6 +103,7 @@ export async function GET(request: Request) {
     return NextResponse.json({
       asOf: now.toISOString(),
       products: results.map(({ product }) => product),
+      unavailableSymbols: unavailableSymbols.sort(),
     }, { headers: apiSuccessHeaders() });
   } catch (error) {
     console.error("Failed to list bank products:", error);

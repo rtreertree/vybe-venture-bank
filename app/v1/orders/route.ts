@@ -6,8 +6,12 @@ import { getServerTime } from "@/lib/bank-clock";
 import { loadMarketQuote, MarketDataError } from "@/lib/bank-market-data";
 import { orderResponse, parseAccountRef } from "@/lib/bank-orders";
 import { prisma } from "@/lib/prisma";
+import { isPrismaErrorCode, withSerializableRetry } from "@/lib/transaction-retry";
 
 export const runtime = "nodejs";
+
+// Preserve sub-cent remainders through division and quantity/cost arithmetic.
+const OrderDecimal = Prisma.Decimal.clone({ precision: 40 });
 
 const validStatuses: Record<string, BankOrderStatus> = {
   pending: "PENDING",
@@ -103,33 +107,44 @@ export async function POST(request: Request) {
     if (!product) return apiError(404, "PRODUCT_NOT_FOUND", `No product exists with symbol ${symbol}.`);
     const now = await getServerTime();
     const market = await loadMarketQuote(product, now);
-    const price = new Prisma.Decimal(market.currentPrice);
-    // Spec: quantity has at most 6 decimals (amount orders round down); total is quantity x price in cents.
+    const price = new OrderDecimal(market.currentPrice);
+    // Quantity is rounded down to six decimals. A buy amount is a cash budget,
+    // so discard its sub-cent remainder before calculating affordable shares.
+    const amount = hasAmount
+      ? new OrderDecimal(requested).toDecimalPlaces(2, Prisma.Decimal.ROUND_DOWN)
+      : null;
     const quantity = (hasQuantity
-      ? new Prisma.Decimal(requested)
-      : new Prisma.Decimal(requested).div(price)
+      ? new OrderDecimal(requested)
+      : amount!.div(price)
     ).toDecimalPlaces(6, Prisma.Decimal.ROUND_DOWN);
     if (quantity.lte(0) || quantity.gt(1_000_000)) {
       return apiError(400, "INVALID_REQUEST", "The calculated order quantity is outside the supported range.");
     }
-    const total = quantity.mul(price).toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP);
+    // Never create cash by splitting a trade: debit buys up and credit sells
+    // down. Sub-cent sells may close a dust position for zero proceeds.
+    const total = quantity.mul(price).toDecimalPlaces(2, side === "buy" ? Prisma.Decimal.ROUND_CEIL : Prisma.Decimal.ROUND_FLOOR);
     const account = await ensureBankAccount(identity.userId);
     if (account.currency !== market.currency) {
       return apiError(400, "INVALID_REQUEST", `Product currency ${market.currency} does not match account currency ${account.currency}.`);
     }
 
-    const order = await prisma.$transaction(async (transaction) => {
+    const result = await withSerializableRetry(() => prisma.$transaction(async (transaction) => {
+      // A concurrent request with this key may have committed before a retry.
+      const repeated = await transaction.bankOrder.findUnique({
+        where: { userId_idempotencyKey: { userId: identity.userId, idempotencyKey } },
+      });
+      if (repeated) return { order: repeated, created: false };
       const currentAccount = await transaction.bankAccount.findUnique({ where: { userId: identity.userId } });
       if (!currentAccount) throw new Error("Bank account was not initialized.");
 
       const holdingKey = { userId_accountRef_symbol: { userId: identity.userId, accountRef, symbol } };
       const existingHolding = await transaction.holding.findUnique({ where: holdingKey });
-      const previousQuantity = existingHolding ? new Prisma.Decimal(existingHolding.quantity) : new Prisma.Decimal(0);
-      const previousAverageCost = existingHolding ? new Prisma.Decimal(existingHolding.avgCost) : new Prisma.Decimal(0);
+      const previousQuantity = new OrderDecimal(existingHolding?.quantity ?? 0);
+      const previousAverageCost = new OrderDecimal(existingHolding?.avgCost ?? 0);
       if (side === "sell" && quantity.gt(previousQuantity)) {
         throw new InsufficientHoldingsError(previousQuantity.toNumber());
       }
-      if (side === "buy" && new Prisma.Decimal(currentAccount.cashBalance).lt(total)) {
+      if (side === "buy" && new OrderDecimal(currentAccount.cashBalance).lt(total)) {
         throw new InsufficientFundsError();
       }
 
@@ -151,7 +166,7 @@ export async function POST(request: Request) {
 
       if (side === "buy") {
         const newQuantity = previousQuantity.add(quantity);
-        const averageCost = previousQuantity.mul(previousAverageCost).add(quantity.mul(price)).div(newQuantity);
+        const averageCost = previousQuantity.mul(previousAverageCost).add(total).div(newQuantity);
         await transaction.bankAccount.update({
           where: { userId: identity.userId },
           data: { cashBalance: { decrement: total.toFixed(2) } },
@@ -197,16 +212,17 @@ export async function POST(request: Request) {
         },
       });
 
-      return created;
-    }, { isolationLevel: "Serializable" });
+      return { order: created, created: true };
+    }, { isolationLevel: "Serializable" }));
 
-    return NextResponse.json(orderResponse(order), { status: 201, headers: apiSuccessHeaders() });
+    return NextResponse.json(orderResponse(result.order), { status: result.created ? 201 : 200, headers: apiSuccessHeaders() });
   } catch (error) {
     if (error instanceof InsufficientFundsError) return apiError(400, "INSUFFICIENT_FUNDS", "Cash balance is lower than the order cost.");
     if (error instanceof InsufficientHoldingsError) {
       return apiError(400, "INSUFFICIENT_HOLDINGS", `Sell quantity exceeds holdings under this accountRef; current quantity is ${error.availableQuantity}.`);
     }
     if (error instanceof MarketDataError) return apiError(502, "MARKET_DATA_UNAVAILABLE", "Unable to retrieve the current market price.");
+    if (isPrismaErrorCode(error, "P2034")) return apiError(503, "ACCOUNT_BUSY", "The account is busy. Retry this request with the same idempotencyKey.");
     if (isPrismaErrorCode(error, "P2002")) {
       try {
         const existing = await prisma.bankOrder.findUnique({
@@ -221,14 +237,9 @@ export async function POST(request: Request) {
     return apiError(500, "INTERNAL_ERROR", "Unable to place the order.");
   }
 }
-
 class InsufficientFundsError extends Error {}
 class InsufficientHoldingsError extends Error {
   constructor(readonly availableQuantity: number) {
     super("Insufficient holdings");
   }
-}
-
-function isPrismaErrorCode(error: unknown, code: string): error is { code: string } {
-  return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }

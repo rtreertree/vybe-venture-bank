@@ -1,9 +1,11 @@
 import { NextResponse } from "next/server";
 import type { InvestmentSide } from "@/generated/prisma/client";
+import { Prisma } from "@/generated/prisma/client";
 import { prisma } from "@/lib/prisma";
 import { getServerTime } from "@/lib/bank-clock";
 import { findMockInvestmentOption } from "@/lib/mock-investment-options";
 import { pricesAtServerTime } from "@/lib/option-pricing";
+import { isPrismaErrorCode, withSerializableRetry } from "@/lib/transaction-retry";
 
 export async function createInvestmentTransaction(request: Request, side: InvestmentSide) {
   let body: unknown;
@@ -39,19 +41,19 @@ export async function createInvestmentTransaction(request: Request, side: Invest
     const unitPrice = (await pricesAtServerTime([option.symbol], tradedAt)).get(option.symbol)?.price ?? option.mock_price;
     const totalAmount = Math.round(unitPrice * quantity * 100) / 100;
 
-    const trade = await prisma.$transaction(async (transaction) => {
+    const trade = await withSerializableRetry(() => prisma.$transaction(async (transaction) => {
       if (side === "SELL") {
         const previousTrades = await transaction.investmentTrade.findMany({
           where: { userId, symbol: option.symbol, assetType: option.asset_type },
           select: { side: true, quantity: true },
         });
         const ownedQuantity = previousTrades.reduce(
-          (total, previousTrade) => total + (previousTrade.side === "BUY" ? previousTrade.quantity : -previousTrade.quantity),
-          0,
+          (total, previousTrade) => previousTrade.side === "BUY" ? total.add(previousTrade.quantity) : total.sub(previousTrade.quantity),
+          new Prisma.Decimal(0),
         );
 
-        if (quantity > ownedQuantity + 0.000001) {
-          throw new InsufficientQuantityError(ownedQuantity);
+        if (new Prisma.Decimal(quantity).gt(ownedQuantity)) {
+          throw new InsufficientQuantityError(ownedQuantity.toNumber());
         }
       }
 
@@ -67,7 +69,7 @@ export async function createInvestmentTransaction(request: Request, side: Invest
           tradedAt,
         },
       });
-    });
+    }, { isolationLevel: "Serializable" }));
 
     return NextResponse.json({
       transaction: {
@@ -90,6 +92,9 @@ export async function createInvestmentTransaction(request: Request, side: Invest
         { error: `Cannot sell ${quantity} units; only ${error.availableQuantity} are currently owned.` },
         { status: 400 },
       );
+    }
+    if (isPrismaErrorCode(error, "P2034")) {
+      return NextResponse.json({ error: "The account is busy. Try again shortly." }, { status: 503, headers: { "Cache-Control": "no-store" } });
     }
     console.error(`Failed to record mock ${side.toLowerCase()} transaction:`, error);
     return NextResponse.json(

@@ -74,22 +74,25 @@ async function fetchYahooSeries(ticker: string, yahooRange: string, interval: st
   const points = timestamps.flatMap((timestamp, index) => {
     const price = closes[index];
     if (typeof price !== "number" || !Number.isFinite(price) || price <= 0) return [];
-    return [{ t: new Date(timestamp * 1000), v: price }];
+    // Validate at the precision PriceBar will persist, including import quotes.
+    const storedPrice = Number(price.toFixed(6));
+    if (storedPrice <= 0) return [];
+    return [{ t: new Date(timestamp * 1000), v: storedPrice }];
   });
   if (points.length === 0) throw new MarketDataError(`Yahoo Finance returned no ${interval} prices for ${ticker}.`);
   return { points, currency: result.meta?.currency, name: result.meta?.longName ?? result.meta?.shortName };
 }
 
 // Stores the downloaded bars. The last few bars of an earlier download may have been partial, so they are rewritten.
-async function storeBars(symbol: string, interval: "DAILY" | "INTRADAY", points: MarketPoint[]) {
-  const latest = await prisma.priceBar.findFirst({ where: { symbol, interval }, orderBy: { t: "desc" }, select: { t: true } });
+async function storeBars(symbol: string, interval: "DAILY" | "INTRADAY", points: MarketPoint[], client: Pick<Prisma.TransactionClient, "priceBar"> = prisma) {
+  const latest = await client.priceBar.findFirst({ where: { symbol, interval }, orderBy: { t: "desc" }, select: { t: true } });
   const tailStart = points[Math.max(0, points.length - 5)].t;
   const cut = latest ? new Date(Math.min(latest.t.getTime(), tailStart.getTime())) : points[0].t;
   const fresh = points.filter(({ t }) => t >= cut);
   const CHUNK = 5_000;
-  await prisma.priceBar.deleteMany({ where: { symbol, interval, t: { gte: cut } } });
+  await client.priceBar.deleteMany({ where: { symbol, interval, t: { gte: cut } } });
   for (let start = 0; start < fresh.length; start += CHUNK) {
-    await prisma.priceBar.createMany({
+    await client.priceBar.createMany({
       data: fresh.slice(start, start + CHUNK).map(({ t, v }) => ({ symbol, interval, t, close: v.toFixed(6) })),
       skipDuplicates: true,
     });
@@ -145,6 +148,57 @@ export type MarketQuote = {
 
 export type MarketSnapshot = MarketQuote & { points: MarketPoint[]; interval: string };
 
+export type DownloadedMarketSnapshot = {
+  quote: MarketQuote;
+  daily: MarketPoint[];
+  intraday: MarketPoint[];
+  dailySyncedAt: Date;
+  intradaySyncedAt: Date | null;
+};
+
+// Validate an import without creating a catalog row. Network requests finish
+// before the transaction that publishes the product and its usable snapshot.
+export async function downloadMarketSnapshot(product: Pick<Product, "symbol" | "name" | "currency">, now: Date): Promise<DownloadedMarketSnapshot> {
+  const ticker = toYahooSymbol(product.symbol);
+  const daily = await fetchYahooSeries(ticker, "max", "1d");
+  const dailySyncedAt = new Date();
+  let intraday: YahooSeries | null = null;
+  let intradaySyncedAt: Date | null = null;
+  try {
+    intraday = await fetchYahooSeries(ticker, "60d", INTRADAY_INTERVAL);
+    intradaySyncedAt = new Date();
+  } catch (error) {
+    if (!(error instanceof MarketDataError)) throw error;
+    console.error(`Could not download intraday prices for ${product.symbol}:`, error);
+  }
+  const cutoff = startOfUtcDay(now);
+  const eligible = [
+    ...daily.points.filter(({ t }) => t < cutoff),
+    ...(intraday?.points ?? []).filter(({ t }) => t <= now),
+  ].sort((left, right) => left.t.getTime() - right.t.getTime());
+  const latest = eligible[eligible.length - 1];
+  if (!latest) throw new MarketDataError(`${product.symbol} has no price data as of ${now.toISOString()}.`);
+  const previous = daily.points.filter(({ t }) => t < startOfUtcDay(latest.t)).at(-1);
+  return {
+    quote: {
+      currency: daily.currency ?? intraday?.currency ?? product.currency,
+      name: daily.name ?? intraday?.name ?? product.name,
+      currentPrice: latest.v,
+      previousClose: previous?.v ?? null,
+      asOf: latest.t,
+    },
+    daily: daily.points,
+    intraday: intraday?.points ?? [],
+    dailySyncedAt,
+    intradaySyncedAt,
+  };
+}
+
+export async function storeDownloadedSnapshot(transaction: Prisma.TransactionClient, symbol: string, snapshot: DownloadedMarketSnapshot) {
+  await storeBars(symbol, "DAILY", snapshot.daily, transaction);
+  if (snapshot.intraday.length) await storeBars(symbol, "INTRADAY", snapshot.intraday, transaction);
+}
+
 // A daily bar is stamped with the market open of its day and holds that day's close, so it is only known once the next UTC day starts.
 async function latestPrice(symbol: string, now: Date) {
   const dailyCutoff = startOfUtcDay(now);
@@ -159,7 +213,7 @@ async function latestPrice(symbol: string, now: Date) {
 async function loadQuoteForProduct(product: Product, now: Date): Promise<{ quote: MarketQuote; product: Product }> {
   const synced = await ensureSnapshot(product, now);
   const latest = await latestPrice(synced.symbol, now);
-  if (!latest) {
+  if (!latest || !Number.isFinite(latest.v) || latest.v <= 0) {
     throw new MarketDataError(`${synced.symbol} has no price data as of ${now.toISOString()}.`);
   }
   const previous = await prisma.priceBar.findFirst({

@@ -43,6 +43,7 @@ export async function GET(request: Request) {
       if (market.currency !== account.currency) {
         throw new Error(`Cannot value ${product.symbol} in ${account.currency}; FX conversion is not configured.`);
       }
+      if (market.points.length === 0) throw new MarketDataError(`No history is available for ${product.symbol}.`);
       marketBySymbol.set(product.symbol, market.points);
       intervals.add(market.interval);
     }));
@@ -59,7 +60,7 @@ export async function GET(request: Request) {
       }, { headers: apiSuccessHeaders() });
     }
 
-    const earliestQuote = Math.max(...[...marketBySymbol.values()].map((points) => points[0].t.getTime()));
+    const earliestQuote = Math.min(...[...marketBySymbol.values()].map((points) => points[0].t.getTime()));
     const eventTimes = orders
       .filter(inScope)
       .map(({ createdAt }) => createdAt.getTime())
@@ -94,12 +95,20 @@ export async function GET(request: Request) {
       }
 
       let value = filtered ? 0 : cash;
+      let fullyPriced = true;
       for (const symbol of symbols) {
         const quantity = quantities.get(symbol) ?? 0;
+        if (quantity <= 0) continue;
         const price = latestPrices.get(symbol);
-        if (quantity > 0 && price !== undefined) value += quantity * price;
+        if (price === undefined) {
+          fullyPriced = false;
+          break;
+        }
+        value += quantity * price;
       }
-      portfolioPoints.push({ t: new Date(time), v: value });
+      // Only open positions need prices. A later listing that has not been
+      // bought yet must not remove otherwise complete earlier valuations.
+      if (fullyPriced) portfolioPoints.push({ t: new Date(time), v: value });
     }
 
     const allPoints = portfolioPoints.filter(({ v }) => Number.isFinite(v));

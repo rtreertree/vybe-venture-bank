@@ -115,17 +115,31 @@ account ID; stored as `""` and returned as `null` when unassigned).
 and `/v1/orders` accept `?accountRef=` to filter. Cash stays shared per user,
 holdings are keyed by `(userId, accountRef, symbol)`, and a sell can only use
 holdings under the same `accountRef`. Order quantities have at most 6 decimals
-(amount orders round down) and `total` is `quantity × price` in cents.
+(amount orders round down). Cash settlement rounds `quantity × price` **up** to
+cents for buys and **down** for sells. This prevents repeated fractional trades
+from creating cash through cent rounding. Buy cost basis includes the actual
+cash debit. A sub-cent sell may close a dust position for zero proceeds.
+For an `amount` order, the bank first rounds the amount down to cents, divides
+by price, and rounds quantity down to 6 decimals; a buy debit never exceeds
+that budget. Amounts below one cent cannot produce a fill. Clients must show
+the settlement rule before confirmation and treat the returned `total` as
+the amount actually debited or credited.
 
 Ranges are `1D`, `1W`, `1M`, `3M`, `1Y`, and `ALL` (default `1M`). The server
 chooses an interval and downsamples chart data. It computes portfolio/product
 metrics and chart summaries; clients should only display those values.
+Portfolio history omits points with unpriced open holdings, so different
+market opening times cannot make a holding look worthless. Earlier complete
+valuations remain available before a later-listed product is bought.
 
 The seeded catalog is USD-denominated. A first access to an unknown user creates
 a mock account with USD 50,000. Market prices and history are refreshed lazily
 from Yahoo Finance and stored in the database; Yahoo's chart endpoint is
 unofficial, requires no API key, and may be rate-limited. Prices are cached for
-about 15 minutes. Historical performance is not a guarantee of future results.
+about 15 minutes. Catalog responses include `unavailableSymbols`; products with
+no usable quote at the selected server time are omitted without hiding usable
+products. New Yahoo imports validate market data before atomically publishing
+the product and its snapshot. Historical performance is not a guarantee of future results.
 Product descriptions and risk notes are not financial advice. The client must
 show an explicit human confirmation before it submits an order.
 
@@ -147,6 +161,9 @@ Invoke-RestMethod `
 Successful new orders return HTTP `201`; repeating the same idempotency key for
 the same user returns the original order rather than filling twice. Errors use
 `{ "error": { "code": "...", "message": "..." } }`.
+Conflicting trades are retried up to three times after the initial attempt.
+If contention persists, `/v1/orders` returns HTTP `503` with `ACCOUNT_BUSY`;
+retry the same request with its original idempotency key.
 
 Before using `/v1`, apply committed migrations and seed the product catalog and
 demo portfolios:
@@ -171,6 +188,9 @@ Buy and sell requests require JSON with `option_id`, `user_id`, and a positive
 `quantity` (up to 1,000,000). The `option_id` must come from `GET /options`.
 Each transaction stores a mock unit price and a server-generated timestamp.
 Successful transactions return HTTP `201`.
+Legacy sells check ownership in a serializable transaction and retry conflicts,
+so concurrent sells cannot each spend the same owned units. Persistent
+contention returns HTTP `503`.
 
 ```json
 {
@@ -193,6 +213,7 @@ Invoke-RestMethod `
 - `npm run dev` — start the development server
 - `npm run build` / `npm start` — build and run the production app
 - `npm run lint` / `npm run typecheck` — validate code
+- `npm test` — run isolated backend and preview regressions without a database or network
 - `npm run db:generate` — generate Prisma Client
 - `npm run db:migrate` — create and apply a development migration
 - `npm run db:deploy` — apply committed migrations

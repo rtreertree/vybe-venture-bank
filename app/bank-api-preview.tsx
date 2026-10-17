@@ -37,7 +37,7 @@ type ProductDetail = Product & {
   riskNote: string;
   issuer: string;
   region: string;
-  returns: Record<string, number>;
+  returns: Record<string, number | null>;
   volatilityPercent: number | null;
   maxDrawdownPercent: number;
   high52w: number;
@@ -95,6 +95,9 @@ const ranges: Range[] = ["1D", "1W", "1M", "3M", "1Y", "ALL"];
 const defaultUser = "";
 
 function money(value: number, currency: string) {
+  if (!/^[A-Z]{3}$/.test(currency)) {
+    return `${new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 }).format(value)} ${currency}`;
+  }
   return new Intl.NumberFormat("en-US", {
     style: "currency",
     currency,
@@ -102,7 +105,8 @@ function money(value: number, currency: string) {
   }).format(value);
 }
 
-function percent(value: number) {
+function percent(value: number | null) {
+  if (value === null) return "—";
   return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
 }
 
@@ -158,10 +162,8 @@ function PriceSeriesChart({
   const selected = hoverIndex === null ? null : points[hoverIndex] ?? null;
   const start = startTime;
   const end = endTime;
-  const markerCandidates = orders.filter((order) =>
-    order.status === "filled" && order.filledPrice !== null
-      && (tradeFilter === "both" || order.side === tradeFilter),
-  );
+  const availableMarkers = orders.filter((order) => order.status === "filled" && order.filledPrice !== null);
+  const markerCandidates = availableMarkers.filter((order) => tradeFilter === "both" || order.side === tradeFilter);
   const latestBuy = markerCandidates
     .filter((order) => order.side === "buy")
     .sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime())[0];
@@ -281,7 +283,7 @@ function PriceSeriesChart({
             <span>Period low <strong>{money(series!.summary.low, currency)}</strong></span>
             <span>As of <strong>{timestamp(series!.asOf)}</strong></span>
           </div>
-          {tradeMarkers.length > 0 && (
+          {availableMarkers.length > 0 && (
             <div className="bank-trade-overlay-controls">
               <div className="bank-chart-legend">
                 <span><i className="buy-dot" /> Latest buy</span>
@@ -754,19 +756,19 @@ export default function BankApiPreview() {
                 <strong>{money(productDetail.currentPrice, productDetail.currency)}<small className={productDetail.dayChangePercent >= 0 ? "positive" : "negative"}>{percent(productDetail.dayChangePercent)} today</small></strong>
               </div>
               <div className="product-stat-grid">
-                <span>Risk <strong>{productDetail.risk}</strong></span><span>52-week high <strong>{money(productDetail.high52w, currency)}</strong></span><span>52-week low <strong>{money(productDetail.low52w, currency)}</strong></span>
+                <span>Risk <strong>{productDetail.risk}</strong></span><span>52-week high <strong>{money(productDetail.high52w, productDetail.currency)}</strong></span><span>52-week low <strong>{money(productDetail.low52w, productDetail.currency)}</strong></span>
                 <span>Volatility <strong>{productDetail.volatilityPercent === null ? "N/A" : `${productDetail.volatilityPercent.toFixed(2)}%`}</strong></span><span>Max drawdown <strong>{productDetail.maxDrawdownPercent.toFixed(2)}%</strong></span><span>Dividend yield <strong>{productDetail.dividendYieldPercent.toFixed(2)}%</strong></span>
               </div>
               <div className="product-facts">
                 <span>Issuer <strong>{productDetail.issuer}</strong></span>
                 <span>Region <strong>{productDetail.region}</strong></span>
-                {productDetail.size !== null && <span>Fund / market size <strong>{money(productDetail.size, currency)}</strong></span>}
+                {productDetail.size !== null && <span>Fund / market size <strong>{money(productDetail.size, productDetail.currency)}</strong></span>}
                 {productDetail.inceptionDate && <span>Inception <strong>{productDetail.inceptionDate}</strong></span>}
               </div>
               {productDetail.topHoldings && productDetail.topHoldings.length > 0 && (
                 <div className="top-holdings-list"><strong>Top holdings</strong>{productDetail.topHoldings.map((holding) => <span key={holding.name}>{holding.name}<b>{holding.weightPercent.toFixed(1)}%</b></span>)}</div>
               )}
-              <div className="return-chips">{Object.entries(productDetail.returns).map(([period, value]) => <span key={period}>{period} <strong className={value >= 0 ? "positive" : "negative"}>{percent(value)}</strong></span>)}</div>
+              <div className="return-chips">{Object.entries(productDetail.returns).map(([period, value]) => <span key={period}>{period} <strong className={value === null ? "" : value >= 0 ? "positive" : "negative"}>{percent(value)}</strong></span>)}</div>
               <div ref={productChartRef} className="bank-product-chart">
                 <div className="bank-chart-controls" aria-label="Product price history range">{ranges.map((item) => <button key={item} type="button" className={range === item ? "active" : ""} onClick={() => setRange(item)}>{item}</button>)}</div>
                 <PriceSeriesChart

@@ -1,7 +1,7 @@
 import type { ProductRisk, ProductType } from "@/generated/prisma/client";
 import { prisma } from "@/lib/prisma";
 import { getServerTime } from "@/lib/bank-clock";
-import { MarketDataError, loadMarketQuote } from "@/lib/bank-market-data";
+import { MarketDataError, downloadMarketSnapshot, storeDownloadedSnapshot } from "@/lib/bank-market-data";
 
 type YahooQuote = {
   symbol?: string;
@@ -102,31 +102,42 @@ export async function addYahooProduct(symbol: string) {
   const match = matches.find((result) => result.symbol === symbol.toUpperCase());
   if (!match) throw new ProductNotFoundError(`Yahoo Finance did not return a supported investment for ${symbol}.`);
 
+  const existing = await prisma.product.findUnique({ where: { symbol: match.symbol } });
+  const snapshot = await downloadMarketSnapshot({ symbol: match.symbol, name: match.name, currency: existing?.currency ?? "USD" }, await getServerTime());
   const risk: ProductRisk = match.type === "CRYPTO" ? "HIGH" : "MEDIUM";
-  const product = await prisma.product.upsert({
-    where: { symbol: match.symbol },
-    create: {
-      symbol: match.symbol,
-      name: match.name,
-      type: match.type,
-      area: match.type === "CRYPTO" ? "Crypto" : "Other",
-      description: match.description,
-      risk,
-      riskNote: match.type === "CRYPTO"
-        ? "Crypto assets can be extremely volatile and may lose most or all of their value."
-        : "Investment values may fluctuate and can fall; review the product information before making decisions.",
-      issuer: match.exchange,
-      region: "Global",
-    },
-    update: {
-      name: match.name,
-      description: match.description,
-      issuer: match.exchange,
-    },
-  });
-
-  const market = await loadMarketQuote(product, await getServerTime());
-  const savedProduct = await prisma.product.findUniqueOrThrow({ where: { symbol: match.symbol } });
+  const savedProduct = await prisma.$transaction(async (transaction) => {
+    const product = await transaction.product.upsert({
+      where: { symbol: match.symbol },
+      create: {
+        symbol: match.symbol,
+        name: snapshot.quote.name,
+        type: match.type,
+        area: match.type === "CRYPTO" ? "Crypto" : "Other",
+        description: match.description,
+        risk,
+        riskNote: match.type === "CRYPTO"
+          ? "Crypto assets can be extremely volatile and may lose most or all of their value."
+          : "Investment values may fluctuate and can fall; review the product information before making decisions.",
+        issuer: match.exchange,
+        region: "Global",
+        currency: snapshot.quote.currency,
+        dailySyncedAt: snapshot.dailySyncedAt,
+        intradaySyncedAt: snapshot.intradaySyncedAt,
+      },
+      update: {
+        name: snapshot.quote.name,
+        description: match.description,
+        issuer: match.exchange,
+        currency: snapshot.quote.currency,
+        dailySyncedAt: snapshot.dailySyncedAt,
+        // A failed intraday refresh leaves any existing intraday snapshot usable.
+        ...(snapshot.intradaySyncedAt ? { intradaySyncedAt: snapshot.intradaySyncedAt } : {}),
+      },
+    });
+    await storeDownloadedSnapshot(transaction, product.symbol, snapshot);
+    return product;
+  }, { timeout: 30_000 });
+  const market = snapshot.quote;
   return {
     symbol: savedProduct.symbol,
     name: market.name ?? savedProduct.name,
